@@ -1,10 +1,34 @@
 -- multi api compat
 local compat = pfQuestCompat
 
+-- Performance: cache frequently-used globals
+local pairs, ipairs, next = pairs, ipairs, next
+local strfind, strlower, strlen = strfind, strlower, strlen
+local format = string.format
+local min, max, abs = math.min, math.max, math.abs
+local floor, ceil = floor or math.floor, ceil or math.ceil
+local band = bit.band
+local getn, insert, concat = table.getn, table.insert, table.concat
+local tostring, tonumber, type = tostring, tonumber, type
+local unpack = unpack
+local GetTime = GetTime
+local UnitLevel, UnitRace, UnitClass = UnitLevel, UnitRace, UnitClass
+local UnitFactionGroup, UnitName, UnitSex = UnitFactionGroup, UnitName, UnitSex
+
+-- Ensure pfQuestConfig.path exists (fallback if config.lua failed to set it)
+if not pfQuestConfig then
+  pfQuestConfig = CreateFrame("Frame", "pfQuestConfig", UIParent)
+  pfQuestConfig:Hide()
+end
+if not pfQuestConfig.path then
+  pfQuestConfig.path = "Interface\\AddOns\\pfQuest"
+end
+
 pfDatabase = { icons = {} }
 
 local loc = GetLocale()
-local dbs = { "items", "quests", "quests-itemreq", "objects", "units", "zones", "professions", "areatrigger", "refloot" }
+local dbs =
+  { "items", "quests", "quests-itemreq", "objects", "units", "zones", "professions", "areatrigger", "refloot" }
 local noloc = { items = true, quests = true, objects = true, units = true }
 
 pfDB.locales = {
@@ -32,15 +56,22 @@ end
 
 -- Return the best cluster point for a coordiante table
 local best, neighbors = { index = 1, neighbors = 0 }, 0
-local cache, cacheindex = {}
-local ymin, ymax, xmin, ymax
+local cache, cacheindex = {}, nil
+local cache_count = 0
+local CLUSTER_CACHE_MAX = 200
+local ymin, ymax, xmin, xmax
 local function getcluster(tbl, name)
   local count = 0
   best.index, best.neighbors = 1, 0
-  cacheindex = string.format("%s:%s", name, table.getn(tbl))
+  cacheindex = format("%s:%s", name, getn(tbl))
 
   -- calculate new cluster if nothing is cached
   if not cache[cacheindex] then
+    -- evict cache if too large
+    if cache_count >= CLUSTER_CACHE_MAX then
+      cache = {}
+      cache_count = 0
+    end
     for index, data in pairs(tbl) do
       -- precalculate the limits, and compare directly.
       -- This way is much faster than the math.abs function.
@@ -61,7 +92,8 @@ local function getcluster(tbl, name)
       end
     end
 
-    cache[cacheindex] = { tbl[best.index][1] + .001, tbl[best.index][2] + .001, count }
+    cache[cacheindex] = { tbl[best.index][1] + 0.001, tbl[best.index][2] + 0.001, count }
+    cache_count = cache_count + 1
   end
 
   return cache[cacheindex][1], cache[cacheindex][2], cache[cacheindex][3]
@@ -69,20 +101,29 @@ end
 
 -- Detects if a non indexed table is empty
 local function isempty(tbl)
-  for _ in pairs(tbl) do return end
-  return true
+  return next(tbl) == nil
 end
 
 -- Returns the levenshtein distance between two strings
 -- based on: https://gist.github.com/Badgerati/3261142
-local len1, len2, cost, best
+local len1, len2, cost, lev_best
 local levcache = {}
+local levcache_count = 0
+local LEVCACHE_MAX = 500
+
+-- Pre-allocate matrix for strings up to 100 chars (reused across calls)
+local lev_matrix = {}
+for i = 0, 100 do
+  lev_matrix[i] = {}
+end
+
 local function lev(str1, str2, limit)
-  if levcache[str1..":"..str2] then
-    return levcache[str1..":"..str2]
+  local key = str1 .. ":" .. str2
+  if levcache[key] then
+    return levcache[key]
   end
 
-  len1, len2, cost = string.len(str1), string.len(str2), 0
+  len1, len2, cost = strlen(str1), strlen(str2), 0
 
   -- abort early on empty strings
   if len1 == 0 then
@@ -93,10 +134,16 @@ local function lev(str1, str2, limit)
     return 0
   end
 
-  -- initialise the base matrix
-  local matrix = {}
+  -- initialise the base matrix (reuse pre-allocated matrix)
+  local matrix = lev_matrix
   for i = 0, len1, 1 do
-    matrix[i] = { [0] = i }
+    if not matrix[i] then
+      matrix[i] = {}
+    end
+    matrix[i][0] = i
+    for j = 1, len2 do
+      matrix[i][j] = nil
+    end
   end
 
   for j = 0, len2, 1 do
@@ -105,54 +152,75 @@ local function lev(str1, str2, limit)
 
   -- levenshtein algorithm
   for i = 1, len1, 1 do
-    best = limit
+    lev_best = limit
 
     for j = 1, len2, 1 do
-      cost = string.byte(str1,i) == string.byte(str2,j) and 0 or 1
-      matrix[i][j] = math.min(matrix[i-1][j] + 1, matrix[i][j-1] + 1, matrix[i-1][j-1] + cost)
+      cost = string.byte(str1, i) == string.byte(str2, j) and 0 or 1
+      matrix[i][j] = min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost)
 
       if limit and matrix[i][j] < limit then
-        best = matrix[i][j]
+        lev_best = matrix[i][j]
       end
     end
 
-    if limit and best >= limit then
-      levcache[str1..":"..str2] = limit
+    if limit and lev_best >= limit then
+      -- evict cache if too large before adding
+      if levcache_count >= LEVCACHE_MAX then
+        levcache = {}
+        levcache_count = 0
+      end
+      levcache[key] = limit
+      levcache_count = levcache_count + 1
       return limit
     end
   end
 
+  -- evict cache if too large before adding
+  if levcache_count >= LEVCACHE_MAX then
+    levcache = {}
+    levcache_count = 0
+  end
+
   -- return the levenshtein distance
-  levcache[str1..":"..str2] = matrix[len1][len2]
+  levcache[key] = matrix[len1][len2]
+  levcache_count = levcache_count + 1
   return matrix[len1][len2]
 end
 
 local loc_core, loc_update
 for _, exp in pairs({ "-tbc", "-wotlk" }) do
   for _, db in pairs(dbs) do
-    if pfDB[db]["data"..exp] then
-      patchtable(pfDB[db]["data"], pfDB[db]["data"..exp])
+    if pfDB[db]["data" .. exp] then
+      patchtable(pfDB[db]["data"], pfDB[db]["data" .. exp])
     end
 
     for loc, _ in pairs(pfDB.locales) do
-      if pfDB[db][loc] and pfDB[db][loc..exp] then
-        loc_update = pfDB[db][loc..exp] or pfDB[db]["enUS"..exp]
+      if pfDB[db][loc] and pfDB[db][loc .. exp] then
+        loc_update = pfDB[db][loc .. exp] or pfDB[db]["enUS" .. exp]
         patchtable(pfDB[db][loc], loc_update)
       end
     end
   end
 
   loc_core = pfDB["professions"][loc] or pfDB["professions"]["enUS"]
-  loc_update = pfDB["professions"][loc..exp] or pfDB["professions"]["enUS"..exp]
-  if loc_update then patchtable(loc_core, loc_update) end
+  loc_update = pfDB["professions"][loc .. exp] or pfDB["professions"]["enUS" .. exp]
+  if loc_update then
+    patchtable(loc_core, loc_update)
+  end
 
-  if pfDB["minimap"..exp] then patchtable(pfDB["minimap"], pfDB["minimap"..exp]) end
-  if pfDB["meta"..exp] then patchtable(pfDB["meta"], pfDB["meta"..exp]) end
+  if pfDB["minimap" .. exp] then
+    patchtable(pfDB["minimap"], pfDB["minimap" .. exp])
+  end
+  if pfDB["meta" .. exp] then
+    patchtable(pfDB["meta"], pfDB["meta" .. exp])
+  end
 end
 
 -- detect installed locales
 for key, name in pairs(pfDB.locales) do
-  if not pfDB["quests"][key] then pfDB.locales[key] = nil end
+  if not pfDB["quests"][key] then
+    pfDB.locales[key] = nil
+  end
 end
 
 -- detect localized databases
@@ -160,15 +228,93 @@ pfDatabase.dbstring = ""
 for id, db in pairs(dbs) do
   -- assign existing locale
   pfDB[db]["loc"] = pfDB[db][loc] or pfDB[db]["enUS"] or {}
-  pfDatabase.dbstring = pfDatabase.dbstring .. " |cffcccccc[|cffffffff" .. db .. "|cffcccccc:|cff33ffcc" .. ( pfDB[db][loc] and loc or "enUS" ) .. "|cffcccccc]"
+  pfDatabase.dbstring = pfDatabase.dbstring
+    .. " |cffcccccc[|cffffffff"
+    .. db
+    .. "|cffcccccc:|cff33ffcc"
+    .. (pfDB[db][loc] and loc or "enUS")
+    .. "|cffcccccc]"
 end
+
+-- Free unused locale data to reduce memory.
+--
+-- The "loc" reference already points to the correct table, so every other
+-- locale table can be dropped and garbage collected.
+--
+-- EXCEPT the plain "quests" locale tables. The quest log's [Translate] button
+-- reads pfDB["quests"][lang][id] for whatever language the user picks, so
+-- freeing those silently disables the feature -- the button stays clickable and
+-- does nothing. If you free them again, remove the button too (see quest.lua).
+-- The "-tbc"/"-wotlk" quest variants are already merged into the base tables
+-- and are not what the button reads, so those still go.
+--
+-- Cost, measured across the eight non-active locales: quests 19.8 MB kept;
+-- items 5.6 / units 2.9 / objects 2.3 MB still freed. Turn the "Quest Text
+-- Translations" option off to reclaim the rest and hide the button.
+local function freelocales(only)
+  for id, db in pairs(dbs) do
+    if not only or db == only then
+      for locale in pairs(pfDB.locales) do
+        if pfDB[db][locale] and pfDB[db][locale] ~= pfDB[db]["loc"] then
+          pfDB[db][locale] = nil
+        end
+      end
+      if pfDB[db]["enUS"] and pfDB[db]["enUS"] ~= pfDB[db]["loc"] then
+        pfDB[db]["enUS"] = nil
+      end
+    end
+  end
+end
+
+for id, db in pairs(dbs) do
+  -- Expansion patch data is merged into the base tables already; always free.
+  pfDB[db]["data-tbc"] = nil
+  pfDB[db]["data-wotlk"] = nil
+  for locale in pairs(pfDB.locales) do
+    pfDB[db][locale .. "-tbc"] = nil
+    pfDB[db][locale .. "-wotlk"] = nil
+  end
+  pfDB[db]["enUS-tbc"] = nil
+  pfDB[db]["enUS-wotlk"] = nil
+
+  if db ~= "quests" then
+    freelocales(db)
+  end
+end
+
+-- The quest locales are only reachable through the [Translate] button, so the
+-- decision needs pfQuest_config -- which is not populated at file scope.
+-- pfQuestConfig:LoadConfig() runs on ADDON_LOADED; VARIABLES_LOADED fires after
+-- every addon's ADDON_LOADED, so the option is guaranteed readable by then.
+pfDatabase.translations = true
+local freequestlocales = CreateFrame("Frame")
+freequestlocales:RegisterEvent("VARIABLES_LOADED")
+freequestlocales:SetScript("OnEvent", function()
+  if pfQuest_config and pfQuest_config["translations"] == "0" then
+    pfDatabase.translations = false
+    freelocales("quests")
+  end
+  this:UnregisterEvent("VARIABLES_LOADED")
+end)
+
+-- Free expansion meta/minimap tables (already merged)
+pfDB["minimap-tbc"] = nil
+pfDB["minimap-wotlk"] = nil
+pfDB["meta-tbc"] = nil
+pfDB["meta-wotlk"] = nil
 
 -- track all previous meta selections on login
 pfDatabase.tracking = CreateFrame("Frame", "pfDatabaseMetaTracking", UIParent)
 pfDatabase.tracking:RegisterEvent("PLAYER_ENTERING_WORLD")
 pfDatabase.tracking:SetScript("OnEvent", function()
   -- break on empty config
-  if not pfQuest_track then return end
+  if not pfQuest_track then
+    return
+  end
+
+  -- build static reject set now that all addon Lua is loaded and
+  -- UnitRace/UnitClass/GetBitByRace are all available
+  pfDatabase:BuildStaticRejectSet()
 
   -- enable all tracked
   for name, data in pairs(pfQuest_track) do
@@ -187,18 +333,31 @@ pfDatabase.itemlist.db_tmp = {}
 pfDatabase.itemlist.registry = {}
 pfDatabase.TrackQuestItemDependency = function(self, item, qid)
   self.itemlist.registry[item] = qid
-  self.itemlist.update = GetTime() + .5
-  self.itemlist:Show()
+  -- only set the deadline if a scan isn't already pending
+  if not self.itemlist.pending then
+    self.itemlist.update = GetTime() + 0.5
+    self.itemlist.pending = true
+    self.itemlist:Show()
+  end
 end
 
 pfDatabase.itemlist:RegisterEvent("BAG_UPDATE")
 pfDatabase.itemlist:SetScript("OnEvent", function()
-  this.update = GetTime() + .5
-  this:Show()
+  -- only set the deadline on the first event in a burst
+  if not this.pending then
+    this.update = GetTime() + 0.5
+    this.pending = true
+    this:Show()
+  end
 end)
 
 pfDatabase.itemlist:SetScript("OnUpdate", function()
-  if GetTime() < this.update then return end
+  if GetTime() < this.update then
+    return
+  end
+
+  -- clear pending flag so the next BAG_UPDATE burst can schedule a new scan
+  this.pending = false
 
   -- remove obsolete registry entries
   for item, qid in pairs(this.registry) do
@@ -207,28 +366,38 @@ pfDatabase.itemlist:SetScript("OnUpdate", function()
     end
   end
 
-  -- save and clean previous items
+  -- swap db and db_tmp: db_tmp becomes the new db, old db becomes previous
   local previous = this.db
-  this.db = {}
+  this.db = this.db_tmp
+  this.db_tmp = previous
+
+  -- clear the new db in-place (avoids table allocation)
+  for k in pairs(this.db) do
+    this.db[k] = nil
+  end
 
   -- fill new item db with bag items
   for bag = 4, 0, -1 do
     for slot = 1, GetContainerNumSlots(bag) do
-      local link = GetContainerItemLink(bag,slot)
+      local link = GetContainerItemLink(bag, slot)
       local _, _, parse = strfind((link or ""), "(%d+):")
       if parse then
         local item = GetItemInfo(parse)
-        if item then this.db[item] = true end
+        if item then
+          this.db[item] = true
+        end
       end
     end
   end
 
   -- fill new item db with equipped items
-  for i=1,19 do
+  for i = 1, 19 do
     if GetInventoryItemLink("player", i) then
-      local _, _, link = string.find(GetInventoryItemLink("player", i), "(item:%d+:%d+:%d+:%d+)");
+      local _, _, link = string.find(GetInventoryItemLink("player", i), "(item:%d+:%d+:%d+:%d+)")
       local item = GetItemInfo(link)
-      if item then this.db[item] = true end
+      if item then
+        this.db[item] = true
+      end
     end
   end
 
@@ -255,7 +424,11 @@ end)
 -- returns item names that are different to the database ones. (check via. Hearthstone)
 CreateFrame("Frame", "pfQuestLocaleCheck", UIParent):SetScript("OnUpdate", function()
   -- throttle to to one item per second
-  if ( this.tick or 0) > GetTime() then return else this.tick = GetTime() + .1 end
+  if (this.tick or 0) > GetTime() then
+    return
+  else
+    this.tick = GetTime() + 0.1
+  end
 
   if not this.dryrun then
     -- give the server one iteration to return the itemname.
@@ -284,11 +457,18 @@ CreateFrame("Frame", "pfQuestLocaleCheck", UIParent):SetScript("OnUpdate", funct
         for id, db in pairs(dbs) do
           -- assign existing locale and update dbstring
           pfDB[db]["loc"] = noloc[db] and pfDB[db]["enUS"] or pfDB[db][loc] or {}
-          pfDatabase.dbstring = pfDatabase.dbstring .. " |cffcccccc[|cffffffff" .. db .. "|cffcccccc:|cff33ffcc" .. ( noloc[db] and "enUS" or loc ) .. "|cffcccccc]"
+          pfDatabase.dbstring = pfDatabase.dbstring
+            .. " |cffcccccc[|cffffffff"
+            .. db
+            .. "|cffcccccc:|cff33ffcc"
+            .. (noloc[db] and "enUS" or loc)
+            .. "|cffcccccc]"
         end
       end
 
       pfDatabase.localized = true
+      pfDatabase:BuildNameIndex()
+      pfDatabase:BuildStaticRejectSet()
       this:Hide()
     end
   end
@@ -296,6 +476,8 @@ CreateFrame("Frame", "pfQuestLocaleCheck", UIParent):SetScript("OnUpdate", funct
   -- set a detection timeout to 15 seconds
   if GetTime() > 15 then
     pfDatabase.localized = true
+    pfDatabase:BuildNameIndex()
+    pfDatabase:BuildStaticRejectSet()
     this:Hide()
   end
 end)
@@ -303,10 +485,16 @@ end)
 -- sanity check the databases
 if isempty(pfDB["quests"]["loc"]) then
   CreateFrame("Frame"):SetScript("OnUpdate", function()
-    if GetTime() < 3 then return end
-    DEFAULT_CHAT_FRAME:AddMessage("|cffff5555 !! |cffffaaaaWrong version of |cff33ffccpf|cffffffffQuest|cffffaaaa detected.|cffff5555 !!")
+    if GetTime() < 3 then
+      return
+    end
+    DEFAULT_CHAT_FRAME:AddMessage(
+      "|cffff5555 !! |cffffaaaaWrong version of |cff33ffccpf|cffffffffQuest|cffffaaaa detected.|cffff5555 !!"
+    )
     DEFAULT_CHAT_FRAME:AddMessage("|cffffccccThe language pack does not match the gameclient's language.")
-    DEFAULT_CHAT_FRAME:AddMessage("|cffffccccYou'd either need to pick the complete or the " .. GetLocale().."-version.")
+    DEFAULT_CHAT_FRAME:AddMessage(
+      "|cffffccccYou'd either need to pick the complete or the " .. GetLocale() .. "-version."
+    )
     DEFAULT_CHAT_FRAME:AddMessage("|cffffccccFor more details, see: https://shagu.org/pfQuest")
     this:Hide()
   end)
@@ -328,6 +516,109 @@ end
 
 pfDatabase.Reload()
 
+-- Inverted name index: maps name → {id, id, ...} for O(1) exact-match lookups.
+-- Built once after locale is known. Used by GetIDByName to skip full-table scans
+-- for exact matches (the hot path in SearchQuestID). Partial-match calls (browser,
+-- slash commands) still use the full scan since they can't use this index.
+pfDatabase.nameIndex = {}
+pfDatabase.lastQuestGiversSet = {}
+
+-- Pre-computed set of quest IDs that will never pass QuestFilter for this
+-- character, regardless of level, questlog, or config changes.
+-- Populated by BuildStaticRejectSet, called from PLAYER_ENTERING_WORLD
+-- and from the locale-detection OnUpdate (covers locale swaps).
+-- Covers: wrong race, wrong class, missing loc name.
+pfDatabase.staticRejectSet = {}
+
+function pfDatabase:BuildNameIndex()
+  local idx = self.nameIndex
+  -- clear existing index in-place
+  for db in pairs(idx) do
+    for name in pairs(idx[db]) do
+      idx[db][name] = nil
+    end
+    idx[db] = nil
+  end
+
+  for _, db in pairs({ "units", "objects", "items" }) do
+    idx[db] = {}
+    for id, loc in pairs(pfDB[db]["loc"]) do
+      if loc then
+        if not idx[db][loc] then
+          idx[db][loc] = {}
+        end
+        insert(idx[db][loc], id)
+      end
+    end
+  end
+
+  -- locale tables may have changed; force SearchQuests to re-add all nodes
+  for id in pairs(self.lastQuestGiversSet) do
+    self.lastQuestGiversSet[id] = nil
+  end
+end
+
+-- BuildStaticRejectSet
+-- Pre-computes the set of quest IDs that can never pass QuestFilter for this
+-- character, independent of level, questlog, history, config, or skills.
+-- Called from PLAYER_ENTERING_WORLD (guaranteed after all Lua is loaded)
+-- and from the locale-detection OnUpdate (covers locale swaps).
+-- Checks: wrong race bitmask, wrong class bitmask, missing loc name.
+function pfDatabase:BuildStaticRejectSet()
+  local reject = self.staticRejectSet
+  for id in pairs(reject) do
+    reject[id] = nil
+  end
+
+  -- UnitRace/UnitClass may return nil before PLAYER_ENTERING_WORLD.
+  -- In that case skip race/class checks; BuildNameIndex is called again
+  -- from the locale-detection OnUpdate after login, which will populate them.
+  local _, race = UnitRace("player")
+  local _, class = UnitClass("player")
+  local prace = race and pfDatabase:GetBitByRace(race) or nil
+  local pclass = class and pfDatabase:GetBitByClass(class) or nil
+
+  for id in pairs(quests) do
+    -- missing loc name
+    if not pfDB.quests.loc[id] or not pfDB.quests.loc[id].T then
+      reject[id] = true
+
+    -- wrong race (only when prace is known)
+    elseif prace and quests[id]["race"] and not (bit.band(quests[id]["race"], prace) == prace) then
+      reject[id] = true
+
+    -- wrong class (only when pclass is known)
+    elseif pclass and quests[id]["class"] and not (bit.band(quests[id]["class"], pclass) == pclass) then
+      reject[id] = true
+    end
+  end
+end
+
+pfDatabase:BuildNameIndex()
+
+-- Reusable parse_obj table (cleared and reused each SearchQuestID call)
+local parse_obj = { ["U"] = {}, ["O"] = {}, ["I"] = {} }
+local function clear_parse_obj()
+  for k in pairs(parse_obj["U"]) do
+    parse_obj["U"][k] = nil
+  end
+  for k in pairs(parse_obj["O"]) do
+    parse_obj["O"][k] = nil
+  end
+  for k in pairs(parse_obj["I"]) do
+    parse_obj["I"][k] = nil
+  end
+end
+
+-- Pre-defined vertex color tables (avoid creating new tables each quest)
+local VERTEX_BLACK = { 0, 0, 0 }
+local VERTEX_RED = { 1, 0.6, 0.6 }
+local VERTEX_WHITE = { 1, 1, 1 }
+local VERTEX_BLUE = { 0.2, 0.8, 1 }
+
+-- factionMap for GetRaceMaskByID (avoid recreation per call)
+local factionMap = { ["A"] = 77, ["H"] = 178, ["AH"] = 255, ["HA"] = 255 }
+
 local bitraces = {
   [1] = "Human",
   [2] = "Orc",
@@ -336,7 +627,7 @@ local bitraces = {
   [16] = "Scourge",
   [32] = "Tauren",
   [64] = "Gnome",
-  [128] = "Troll"
+  [128] = "Troll",
 }
 
 -- append with playable races by expansion
@@ -358,7 +649,7 @@ local bitclasses = {
   [64] = "SHAMAN",
   [128] = "MAGE",
   [256] = "WARLOCK",
-  [1024] = "DRUID"
+  [1024] = "DRUID",
 }
 
 -- make it public for extensions
@@ -378,16 +669,34 @@ function pfDatabase:IsFriendly(id)
 end
 
 function pfDatabase:BuildQuestDescription(meta)
-  if not meta.title or not meta.quest or not meta.QTYPE then return meta.description end
+  if not meta.title or not meta.quest or not meta.QTYPE then
+    return meta.description
+  end
 
   if meta.QTYPE == "NPC_START" then
-    return string.format(pfQuest_Loc["Speak with |cff33ffcc%s|r to obtain |cffffcc00[!]|cff33ffcc %s|r"], (meta.spawn or UNKNOWN), (meta.quest or UNKNOWN))
+    return string.format(
+      pfQuest_Loc["Speak with |cff33ffcc%s|r to obtain |cffffcc00[!]|cff33ffcc %s|r"],
+      (meta.spawn or UNKNOWN),
+      (meta.quest or UNKNOWN)
+    )
   elseif meta.QTYPE == "OBJECT_START" then
-    return string.format(pfQuest_Loc["Interact with |cff33ffcc%s|r to obtain |cffffcc00[!]|cff33ffcc %s|r"], (meta.spawn or UNKNOWN), (meta.quest or UNKNOWN))
+    return string.format(
+      pfQuest_Loc["Interact with |cff33ffcc%s|r to obtain |cffffcc00[!]|cff33ffcc %s|r"],
+      (meta.spawn or UNKNOWN),
+      (meta.quest or UNKNOWN)
+    )
   elseif meta.QTYPE == "NPC_END" then
-    return string.format(pfQuest_Loc["Speak with |cff33ffcc%s|r to complete |cffffcc00[?]|cff33ffcc %s|r"], (meta.spawn or UNKNOWN), (meta.quest or UNKNOWN))
+    return string.format(
+      pfQuest_Loc["Speak with |cff33ffcc%s|r to complete |cffffcc00[?]|cff33ffcc %s|r"],
+      (meta.spawn or UNKNOWN),
+      (meta.quest or UNKNOWN)
+    )
   elseif meta.QTYPE == "OBJECT_END" then
-    return string.format(pfQuest_Loc["Interact with |cff33ffcc%s|r to complete |cffffcc00[?]|cff33ffcc %s|r"], (meta.spawn or UNKNOWN), (meta.quest or UNKNOWN))
+    return string.format(
+      pfQuest_Loc["Interact with |cff33ffcc%s|r to complete |cffffcc00[?]|cff33ffcc %s|r"],
+      (meta.spawn or UNKNOWN),
+      (meta.quest or UNKNOWN)
+    )
   elseif meta.QTYPE == "UNIT_OBJECTIVE" then
     if pfDatabase:IsFriendly(meta.spawnid) then
       return string.format(pfQuest_Loc["Talk to |cff33ffcc%s|r"], (meta.spawn or UNKNOWN))
@@ -395,15 +704,31 @@ function pfDatabase:BuildQuestDescription(meta)
       return string.format(pfQuest_Loc["Kill |cff33ffcc%s|r"], (meta.spawn or UNKNOWN))
     end
   elseif meta.QTYPE == "UNIT_OBJECTIVE_ITEMREQ" then
-    return string.format(pfQuest_Loc["Use |cff33ffcc%s|r on |cff33ffcc%s|r"], (meta.itemreq or UNKNOWN), (meta.spawn or UNKNOWN))
+    return string.format(
+      pfQuest_Loc["Use |cff33ffcc%s|r on |cff33ffcc%s|r"],
+      (meta.itemreq or UNKNOWN),
+      (meta.spawn or UNKNOWN)
+    )
   elseif meta.QTYPE == "OBJECT_OBJECTIVE" then
     return string.format(pfQuest_Loc["Interact with |cff33ffcc%s|r"], (meta.spawn or UNKNOWN))
   elseif meta.QTYPE == "OBJECT_OBJECTIVE_ITEMREQ" then
-    return string.format(pfQuest_Loc["Use |cff33ffcc%s|r at |cff33ffcc%s|r"], (meta.itemreq or UNKNOWN), (meta.spawn or UNKNOWN))
+    return string.format(
+      pfQuest_Loc["Use |cff33ffcc%s|r at |cff33ffcc%s|r"],
+      (meta.itemreq or UNKNOWN),
+      (meta.spawn or UNKNOWN)
+    )
   elseif meta.QTYPE == "ITEM_OBJECTIVE_LOOT" then
-    return string.format(pfQuest_Loc["Loot |cff33ffcc[%s]|r from |cff33ffcc%s|r"], (meta.item or UNKNOWN), (meta.spawn or UNKNOWN))
+    return string.format(
+      pfQuest_Loc["Loot |cff33ffcc[%s]|r from |cff33ffcc%s|r"],
+      (meta.item or UNKNOWN),
+      (meta.spawn or UNKNOWN)
+    )
   elseif meta.QTYPE == "ITEM_OBJECTIVE_USE" then
-    return string.format(pfQuest_Loc["Loot and/or Use |cff33ffcc[%s]|r from |cff33ffcc%s|r"], (meta.item or UNKNOWN), (meta.spawn or UNKNOWN))
+    return string.format(
+      pfQuest_Loc["Loot and/or Use |cff33ffcc[%s]|r from |cff33ffcc%s|r"],
+      (meta.item or UNKNOWN),
+      (meta.spawn or UNKNOWN)
+    )
   elseif meta.QTYPE == "AREATRIGGER_OBJECTIVE" then
     return string.format(pfQuest_Loc["Explore |cff33ffcc%s|r"], (meta.spawn or UNKNOWN))
   elseif meta.QTYPE == "ZONE_OBJECTIVE" then
@@ -424,10 +749,10 @@ function pfDatabase:ShowExtendedTooltip(id, tooltip, parent, anchor, offx, offy)
   local data = pfDB["quests"]["data"][id]
 
   if locales then
-    tooltip:SetText((locales["T"] or UNKNOWN), .3, 1, .8)
+    tooltip:SetText((locales["T"] or UNKNOWN), 0.3, 1, 0.8)
     tooltip:AddLine(" ")
   else
-    tooltip:SetText(UNKNOWN, .3, 1, .8)
+    tooltip:SetText(UNKNOWN, 0.3, 1, 0.8)
   end
 
   if data then
@@ -436,37 +761,37 @@ function pfDatabase:ShowExtendedTooltip(id, tooltip, parent, anchor, offx, offy)
     queststate = pfQuest.questlog[id] and 1 or queststate
 
     if queststate == 0 then
-      tooltip:AddLine(pfQuest_Loc["You don't have this quest."] .. "\n\n", 1, .5, .5)
+      tooltip:AddLine(pfQuest_Loc["You don't have this quest."] .. "\n\n", 1, 0.5, 0.5)
     elseif queststate == 1 then
-      tooltip:AddLine(pfQuest_Loc["You are on this quest."] .. "\n\n", 1, 1, .5)
+      tooltip:AddLine(pfQuest_Loc["You are on this quest."] .. "\n\n", 1, 1, 0.5)
     elseif queststate == 2 then
-      tooltip:AddLine(pfQuest_Loc["You already did this quest."] .. "\n\n", .5, 1, .5)
+      tooltip:AddLine(pfQuest_Loc["You already did this quest."] .. "\n\n", 0.5, 1, 0.5)
     end
 
     -- quest start
     if data["start"] then
-      for key, db in pairs({["U"]="units", ["O"]="objects", ["I"]="items"}) do
+      for key, db in pairs({ ["U"] = "units", ["O"] = "objects", ["I"] = "items" }) do
         if data["start"][key] then
           local entries = ""
           for _, id in pairs(data["start"][key]) do
-            entries = entries .. (entries == "" and "" or ", ") .. ( pfDB[db]["loc"][id] or UNKNOWN )
+            entries = entries .. (entries == "" and "" or ", ") .. (pfDB[db]["loc"][id] or UNKNOWN)
           end
 
-          tooltip:AddDoubleLine(pfQuest_Loc["Quest Start"]..":", entries, 1,1,1, 1,1,.8)
+          tooltip:AddDoubleLine(pfQuest_Loc["Quest Start"] .. ":", entries, 1, 1, 1, 1, 1, 0.8)
         end
       end
     end
 
     -- quest end
     if data["end"] then
-      for key, db in pairs({["U"]="units", ["O"]="objects"}) do
+      for key, db in pairs({ ["U"] = "units", ["O"] = "objects" }) do
         if data["end"][key] then
           local entries = ""
           for _, id in ipairs(data["end"][key]) do
-            entries = entries .. (entries == "" and "" or ", ") .. ( pfDB[db]["loc"][id] or UNKNOWN )
+            entries = entries .. (entries == "" and "" or ", ") .. (pfDB[db]["loc"][id] or UNKNOWN)
           end
 
-          tooltip:AddDoubleLine(pfQuest_Loc["Quest End"]..":", entries, 1,1,1, 1,1,.8)
+          tooltip:AddDoubleLine(pfQuest_Loc["Quest End"] .. ":", entries, 1, 1, 1, 1, 1, 0.8)
         end
       end
     end
@@ -476,13 +801,13 @@ function pfDatabase:ShowExtendedTooltip(id, tooltip, parent, anchor, offx, offy)
     -- obectives
     if locales["O"] and locales["O"] ~= "" then
       tooltip:AddLine(" ")
-      tooltip:AddLine(pfDatabase:FormatQuestText(locales["O"]),1,1,1,true)
+      tooltip:AddLine(pfDatabase:FormatQuestText(locales["O"]), 1, 1, 1, true)
     end
 
     -- details
     if locales["D"] and locales["D"] ~= "" then
       tooltip:AddLine(" ")
-      tooltip:AddLine(pfDatabase:FormatQuestText(locales["D"]),.6,.6,.6,true)
+      tooltip:AddLine(pfDatabase:FormatQuestText(locales["D"]), 0.6, 0.6, 0.6, true)
     end
   end
 
@@ -509,9 +834,11 @@ end
 -- GetPlayerSkill
 -- Returns false if the player doesn't have the required skill, or their rank if they do
 function pfDatabase:GetPlayerSkill(skill)
-  if not professions[skill] then return false end
+  if not professions[skill] then
+    return false
+  end
 
-  for i=0,GetNumSkillLines() do
+  for i = 0, GetNumSkillLines() do
     local skillName, _, _, skillRank = GetSkillLineInfo(i)
     if skillName == professions[skill] then
       return skillRank
@@ -526,7 +853,9 @@ end
 function pfDatabase:GetBitByRace(model)
   -- scan for regular bitmasks
   for bit, v in pairs(bitraces) do
-    if model == v then return bit end
+    if model == v then
+      return bit
+    end
   end
 
   -- return alliance/horde racemask as fallback for unknown races
@@ -537,7 +866,9 @@ end
 -- Returns bit of the current class
 function pfDatabase:GetBitByClass(class)
   for bit, v in pairs(bitclasses) do
-    if class == v then return bit end
+    if class == v then
+      return bit
+    end
   end
 end
 
@@ -548,25 +879,23 @@ function pfDatabase:GetHexDifficultyColor(level, force)
     return "|cffff5555"
   else
     local c = pfQuestCompat.GetDifficultyColor(level)
-    return string.format("|cff%02x%02x%02x", c.r*255, c.g*255, c.b*255)
+    return string.format("|cff%02x%02x%02x", c.r * 255, c.g * 255, c.b * 255)
   end
 end
 
 -- GetRaceMaskByID
 function pfDatabase:GetRaceMaskByID(id, db)
-  -- 64 + 8 + 4 + 1 = 77 = Alliance
-  -- 128 + 32 + 16 + 2 = 178 = Horde
-  local factionMap = {["A"]=77, ["H"]=178, ["AH"]=255, ["HA"]=255}
+  -- Uses module-level factionMap: A=77, H=178, AH/HA=255
   local raceMask = 0
 
   if db == "quests" then
     raceMask = quests[id]["race"] or raceMask
 
-    if (quests[id]["start"]) then
+    if quests[id]["start"] then
       local questStartRaceMask = 0
 
       -- get quest starter faction
-      if (quests[id]["start"]["U"]) then
+      if quests[id]["start"]["U"] then
         for _, startUnitId in ipairs(quests[id]["start"]["U"]) do
           if units[startUnitId] and units[startUnitId]["fac"] and factionMap[units[startUnitId]["fac"]] then
             questStartRaceMask = bit.bor(factionMap[units[startUnitId]["fac"]])
@@ -575,7 +904,7 @@ function pfDatabase:GetRaceMaskByID(id, db)
       end
 
       -- get quest object starter faction
-      if (quests[id]["start"]["O"]) then
+      if quests[id]["start"]["O"] then
         for _, startObjectId in ipairs(quests[id]["start"]["O"]) do
           if objects[startObjectId] and objects[startObjectId]["fac"] and factionMap[objects[startObjectId]["fac"]] then
             questStartRaceMask = bit.bor(factionMap[objects[startObjectId]["fac"]])
@@ -599,11 +928,30 @@ end
 -- Scans localization tables for matching IDs
 -- Returns table with all IDs
 function pfDatabase:GetIDByName(name, db, partial, server)
-  if not pfDB[db] then return nil end
+  if not pfDB[db] then
+    return nil
+  end
   local ret = {}
 
+  -- Fast path: O(1) index lookup for exact case-sensitive matches with no
+  -- server filter. This is the hot path called from SearchQuestID for monster
+  -- and item objective lookups. Quests are excluded because their loc is a
+  -- table ({T=, O=, D=}) and are not indexed.
+  if not partial and not server and db ~= "quests" then
+    local ids = pfDatabase.nameIndex[db] and pfDatabase.nameIndex[db][name]
+    if ids then
+      for _, id in pairs(ids) do
+        ret[id] = pfDB[db]["loc"][id]
+      end
+    end
+    return ret
+  end
+
+  -- Slow path: full scan for partial matches (browser/slash commands) and quests
   for id, loc in pairs(pfDB[db]["loc"]) do
-    if db == "quests" then loc = loc["T"] end
+    if db == "quests" then
+      loc = loc["T"]
+    end
 
     local custom = server and pfQuest_server[db] and pfQuest_server[db][id] or not server
     if loc and name then
@@ -623,11 +971,15 @@ end
 -- Scans localization tables for matching IDs
 -- Returns table with all IDs
 function pfDatabase:GetIDByIDPart(idPart, db)
-  if not pfDB[db] then return nil end
+  if not pfDB[db] then
+    return nil
+  end
   local ret = {}
 
   for id, loc in pairs(pfDB[db]["loc"]) do
-    if db == "quests" then loc = loc["T"] end
+    if db == "quests" then
+      loc = loc["T"]
+    end
 
     if idPart and loc and strfind(tostring(id), idPart) then
       ret[id] = loc
@@ -644,9 +996,9 @@ function pfDatabase:GetBestMap(maps)
 
   -- calculate best map results
   for map, count in pairs(maps or {}) do
-    if count > bestscore or ( count == 0 and bestscore == 0 ) then
+    if count > bestscore or (count == 0 and bestscore == 0) then
       bestscore = count
-      bestmap   = map
+      bestmap = map
     end
   end
 
@@ -657,7 +1009,9 @@ end
 -- Scans for all mobs with a specified ID
 -- Adds map nodes for each and returns its map table
 function pfDatabase:SearchAreaTriggerID(id, meta, maps, prio)
-  if not areatrigger[id] or not areatrigger[id]["coords"] then return maps end
+  if not areatrigger[id] or not areatrigger[id]["coords"] then
+    return maps
+  end
 
   local maps = maps or {}
   local prio = prio or 1
@@ -673,9 +1027,9 @@ function pfDatabase:SearchAreaTriggerID(id, meta, maps, prio)
       meta["item"] = nil
 
       meta["title"] = meta["quest"] or meta["item"] or meta["spawn"]
-      meta["zone"]  = zone
-      meta["x"]     = x
-      meta["y"]     = y
+      meta["zone"] = zone
+      meta["x"] = x
+      meta["y"] = y
 
       meta["level"] = pfQuest_Loc["N/A"]
       meta["spawntype"] = pfQuest_Loc["Trigger"]
@@ -693,27 +1047,32 @@ end
 -- Scans for all mobs with a specified ID
 -- Adds map nodes for each and returns its map table
 function pfDatabase:SearchMobID(id, meta, maps, prio)
-  if not units[id] or not units[id]["coords"] then return maps end
+  if not units[id] or not units[id]["coords"] then
+    return maps
+  end
 
   local maps = maps or {}
   local prio = prio or 1
+  meta = meta or {}
+
+  -- hoist invariant fields outside the coord loop; these are the same for
+  -- every spawn point of this mob so there is no need to set them per-coord
+  meta["spawn"] = pfDB.units.loc[id]
+  meta["spawnid"] = id
+  meta["title"] = meta["quest"] or meta["item"] or meta["spawn"]
+  meta["level"] = units[id]["lvl"] or UNKNOWN
+  meta["spawntype"] = pfQuest_Loc["Unit"]
+  -- description only depends on the above invariant fields + QTYPE/quest/item
+  -- compute once here; AddNode will skip its own BuildQuestDescription call
+  meta["description"] = pfDatabase:BuildQuestDescription(meta)
 
   for _, data in pairs(units[id]["coords"]) do
     local x, y, zone, respawn = unpack(data)
 
     if zone > 0 then
-      -- add all gathered data
-      meta = meta or {}
-      meta["spawn"] = pfDB.units.loc[id]
-      meta["spawnid"] = id
-
-      meta["title"] = meta["quest"] or meta["item"] or meta["spawn"]
-      meta["zone"]  = zone
-      meta["x"]     = x
-      meta["y"]     = y
-
-      meta["level"] = units[id]["lvl"] or UNKNOWN
-      meta["spawntype"] = pfQuest_Loc["Unit"]
+      meta["zone"] = zone
+      meta["x"] = x
+      meta["y"] = y
       meta["respawn"] = respawn > 0 and SecondsToTime(respawn)
 
       maps[zone] = maps[zone] and maps[zone] + prio or prio
@@ -746,14 +1105,17 @@ function pfDatabase:SearchMetaRelation(query, meta, show)
   local maps = {}
 
   -- abort on invalid queries
-  if not query.name then return end
+  if not query or not query.name then
+    return
+  end
 
   -- convert track name aliases
   local track = alias[query.name] or query.name
 
   if pfDB["meta"] and pfDB["meta"][track] then
     -- check which faction should be searched
-    local faction = query.faction and string.lower(query.faction) or (UnitFactionGroup("player") and string.lower(UnitFactionGroup("player")))
+    local faction = query.faction and string.lower(query.faction)
+      or (UnitFactionGroup("player") and string.lower(UnitFactionGroup("player")))
     faction = faction == "horde" and "H" or faction == "alliance" and "A" or ""
 
     -- iterate over all tracking entries
@@ -812,15 +1174,15 @@ end
 -- tracking variable per character and returns a map table
 function pfDatabase:TrackMeta(list, state)
   local list = alias[list] and alias[list] or list
-  local identifier = "TRACK_"..string.upper(list)
+  local identifier = "TRACK_" .. string.upper(list)
 
   local meta = {
     ["addon"] = identifier,
-    ["icon"] = pfQuestConfig.path.."\\img\\tracking\\"..list,
+    ["icon"] = pfQuestConfig.path .. "\\img\\tracking\\" .. list,
   }
 
   local query = {
-    name = list
+    name = list,
   }
 
   local maps = nil
@@ -831,7 +1193,9 @@ function pfDatabase:TrackMeta(list, state)
   pfMap:UpdateNodes()
 
   -- break here if nothing should be tracked
-  if not state then return end
+  if not state then
+    return
+  end
 
   -- add extended state values to query
   -- this is used for min/max values
@@ -846,7 +1210,9 @@ function pfDatabase:TrackMeta(list, state)
   local maps = pfDatabase:SearchMetaRelation(query, meta)
 
   -- remove invalid results
-  if not maps then pfQuest_track[list] = nil end
+  if not maps then
+    pfQuest_track[list] = nil
+  end
 
   -- return map results
   return maps
@@ -871,7 +1237,9 @@ end
 -- Scans for all zones with a specific ID
 -- Add nodes to the center of that location
 function pfDatabase:SearchZoneID(id, meta, maps, prio)
-  if not zones[id] then return maps end
+  if not zones[id] then
+    return maps
+  end
 
   local maps = maps or {}
   local prio = prio or 1
@@ -886,12 +1254,12 @@ function pfDatabase:SearchZoneID(id, meta, maps, prio)
     meta["spawnid"] = id
 
     meta["title"] = meta["quest"] or meta["item"] or meta["spawn"]
-    meta["zone"]  = zone
+    meta["zone"] = zone
     meta["level"] = "N/A"
     meta["spawntype"] = pfQuest_Loc["Area/Zone"]
     meta["respawn"] = "N/A"
-    meta["x"]     = x
-    meta["y"]     = y
+    meta["x"] = x
+    meta["y"] = y
 
     pfMap:AddNode(meta)
     return maps
@@ -916,13 +1284,15 @@ function pfDatabase:SearchZone(obj, meta, partial)
 end
 
 function pfDatabase:SearchObjectSkill(id)
-  if not id or not tonumber(id) then return end
+  if not id or not tonumber(id) then
+    return
+  end
   local skill, caption = nil, nil
 
-  if (pfDB["meta"]["herbs"][-id]) then
+  if pfDB["meta"]["herbs"][-id] then
     skill = pfDB["meta"]["herbs"][-id]
     caption = pfQuest_Loc["Herbalism"]
-  elseif (pfDB["meta"]["mines"][-id]) then
+  elseif pfDB["meta"]["mines"][-id] then
     skill = pfDB["meta"]["mines"][-id]
     caption = pfQuest_Loc["Mining"]
   end
@@ -933,28 +1303,31 @@ end
 -- Scans for all objects with a specified ID
 -- Adds map nodes for each and returns its map table
 function pfDatabase:SearchObjectID(id, meta, maps, prio)
-  if not objects[id] or not objects[id]["coords"] then return maps end
+  if not objects[id] or not objects[id]["coords"] then
+    return maps
+  end
 
   local skill, caption = pfDatabase:SearchObjectSkill(id)
   local maps = maps or {}
   local prio = prio or 1
+  meta = meta or {}
+
+  -- hoist invariant fields outside the coord loop
+  meta["spawn"] = pfDB.objects.loc[id]
+  meta["spawnid"] = id
+  meta["title"] = meta["quest"] or meta["item"] or meta["spawn"]
+  meta["level"] = skill and string.format("%s [%s]", skill, caption) or nil
+  meta["spawntype"] = pfQuest_Loc["Object"]
+  -- description only depends on invariant fields; compute once
+  meta["description"] = pfDatabase:BuildQuestDescription(meta)
 
   for _, data in pairs(objects[id]["coords"]) do
     local x, y, zone, respawn = unpack(data)
 
     if zone > 0 then
-      -- add all gathered data
-      meta = meta or {}
-      meta["spawn"] = pfDB.objects.loc[id]
-      meta["spawnid"] = id
-
-      meta["title"] = meta["quest"] or meta["item"] or meta["spawn"]
-      meta["zone"]  = zone
-      meta["x"]     = x
-      meta["y"]     = y
-
-      meta["level"] = skill and string.format("%s [%s]", skill, caption) or nil
-      meta["spawntype"] = pfQuest_Loc["Object"]
+      meta["zone"] = zone
+      meta["x"] = x
+      meta["y"] = y
       meta["respawn"] = respawn and SecondsToTime(respawn)
 
       maps[zone] = maps[zone] and maps[zone] + prio or prio
@@ -985,7 +1358,9 @@ end
 -- Adds map nodes for each drop and vendor
 -- Returns its map table
 function pfDatabase:SearchItemID(id, meta, maps, allowedTypes)
-  if not items[id] then return maps end
+  if not items[id] then
+    return maps
+  end
 
   local maps = maps or {}
   local meta = meta or {}
@@ -994,7 +1369,9 @@ function pfDatabase:SearchItemID(id, meta, maps, allowedTypes)
   meta["item"] = pfDB.items.loc[id]
 
   local minChance = tonumber(pfQuest_config.mindropchance)
-  if not minChance then minChance = 0 end
+  if not minChance then
+    minChance = 0
+  end
 
   -- search unit drops
   if items[id]["U"] and ((not allowedTypes) or allowedTypes["U"]) then
@@ -1050,7 +1427,7 @@ function pfDatabase:SearchItemID(id, meta, maps, allowedTypes)
   -- search vendor goods
   if items[id]["V"] and ((not allowedTypes) or allowedTypes["V"]) then
     for unit, chance in pairs(items[id]["V"]) do
-      meta["texture"] = pfQuestConfig.path.."\\img\\icon_vendor"
+      meta["texture"] = pfQuestConfig.path .. "\\img\\icon_vendor"
       meta["droprate"] = nil
       meta["sellcount"] = chance
       maps = pfDatabase:SearchMobID(unit, meta, maps)
@@ -1091,7 +1468,7 @@ function pfDatabase:SearchVendor(item, meta)
     -- search vendor goods
     if items[id] and items[id]["V"] then
       for unit, chance in pairs(items[id]["V"]) do
-        meta["texture"] = pfQuestConfig.path.."\\img\\icon_vendor"
+        meta["texture"] = pfQuestConfig.path .. "\\img\\icon_vendor"
         meta["droprate"] = nil
         meta["sellcount"] = chance
         maps = pfDatabase:SearchMobID(unit, meta, maps)
@@ -1107,7 +1484,9 @@ end
 -- Adds map nodes for each objective and involved units
 -- Returns its map table
 function pfDatabase:SearchQuestID(id, meta, maps)
-  if not quests[id] then return end
+  if not quests[id] then
+    return
+  end
   local maps = maps or {}
   local meta = meta or {}
 
@@ -1130,7 +1509,7 @@ function pfDatabase:SearchQuestID(id, meta, maps)
           meta = meta or {}
           meta["QTYPE"] = "NPC_START"
           meta["layer"] = meta["layer"] or 4
-          meta["texture"] = pfQuestConfig.path.."\\img\\available_c"
+          meta["texture"] = pfQuestConfig.path .. "\\img\\available_c"
           maps = pfDatabase:SearchMobID(unit, meta, maps, 0)
         end
       end
@@ -1140,7 +1519,7 @@ function pfDatabase:SearchQuestID(id, meta, maps)
         for _, object in pairs(quests[id]["start"]["O"]) do
           meta = meta or {}
           meta["QTYPE"] = "OBJECT_START"
-          meta["texture"] = pfQuestConfig.path.."\\img\\available_c"
+          meta["texture"] = pfQuestConfig.path .. "\\img\\available_c"
           maps = pfDatabase:SearchObjectID(object, meta, maps, 0)
         end
       end
@@ -1148,24 +1527,22 @@ function pfDatabase:SearchQuestID(id, meta, maps)
 
     -- search quest-ender
     if quests[id]["end"] then
+      -- compute complete state once, outside both ender loops
+      local ender_texture
+      if meta["qlogid"] then
+        local _, _, _, _, _, complete = compat.GetQuestLogTitle(meta["qlogid"])
+        complete = complete or GetNumQuestLeaderBoards(meta["qlogid"]) == 0 and true or nil
+        ender_texture = (complete == true or complete == 1) and pfQuestConfig.path .. "\\img\\complete_c"
+          or pfQuestConfig.path .. "\\img\\complete"
+      else
+        ender_texture = pfQuestConfig.path .. "\\img\\complete_c"
+      end
+
       -- units
       if quests[id]["end"]["U"] then
         for _, unit in pairs(quests[id]["end"]["U"]) do
-          meta = meta or {}
-
-          if meta["qlogid"] then
-            local _, _, _, _, _, complete = compat.GetQuestLogTitle(meta["qlogid"])
-            complete = complete or GetNumQuestLeaderBoards(meta["qlogid"]) == 0 and true or nil
-            if complete == true or complete == 1 then
-              meta["texture"] = pfQuestConfig.path.."\\img\\complete_c"
-            else
-              meta["texture"] = pfQuestConfig.path.."\\img\\complete"
-            end
-          else
-            meta["texture"] = pfQuestConfig.path.."\\img\\complete_c"
-          end
+          meta["texture"] = ender_texture
           meta["QTYPE"] = "NPC_END"
-
           maps = pfDatabase:SearchMobID(unit, meta, maps, 0)
         end
       end
@@ -1173,53 +1550,38 @@ function pfDatabase:SearchQuestID(id, meta, maps)
       -- objects
       if quests[id]["end"]["O"] then
         for _, object in pairs(quests[id]["end"]["O"]) do
-          meta = meta or {}
-
-          if meta["qlogid"] then
-            local _, _, _, _, _, complete = compat.GetQuestLogTitle(meta["qlogid"])
-            complete = complete or GetNumQuestLeaderBoards(meta["qlogid"]) == 0 and true or nil
-            if complete then
-              meta["texture"] = pfQuestConfig.path.."\\img\\complete_c"
-            else
-              meta["texture"] = pfQuestConfig.path.."\\img\\complete"
-            end
-          else
-            meta["texture"] = pfQuestConfig.path.."\\img\\complete_c"
-          end
-
+          meta["texture"] = ender_texture
           meta["QTYPE"] = "OBJECT_END"
-
           maps = pfDatabase:SearchObjectID(object, meta, maps, 0)
         end
       end
     end
   end
 
-  local parse_obj = {
-    ["U"] = {},
-    ["O"] = {},
-    ["I"] = {},
-  }
+  -- Clear and reuse the module-level parse_obj table
+  clear_parse_obj()
 
   -- If QuestLogID is given, scan and add all finished objectives to blacklist
   if meta["qlogid"] then
     local objectives = GetNumQuestLeaderBoards(meta["qlogid"])
     local _, _, _, _, _, complete = compat.GetQuestLogTitle(meta["qlogid"])
-    if complete then return maps end
+    if complete then
+      return maps
+    end
 
     if objectives then
-      for i=1, objectives, 1 do
+      for i = 1, objectives, 1 do
         local text, type, done = GetQuestLogLeaderBoard(i, meta["qlogid"])
 
         -- spawn data
         if type == "monster" then
           local i, j, monsterName, objNum, objNeeded = strfind(text, pfUI.api.SanitizePattern(QUEST_MONSTERS_KILLED))
           for id in pairs(pfDatabase:GetIDByName(monsterName, "units")) do
-            parse_obj["U"][id] = ( objNum + 0 >= objNeeded + 0 or done ) and "DONE" or "PROG"
+            parse_obj["U"][id] = (objNum + 0 >= objNeeded + 0 or done) and "DONE" or "PROG"
           end
 
           for id in pairs(pfDatabase:GetIDByName(monsterName, "objects")) do
-            parse_obj["O"][id] = ( objNum + 0 >= objNeeded + 0 or done ) and "DONE" or "PROG"
+            parse_obj["O"][id] = (objNum + 0 >= objNeeded + 0 or done) and "DONE" or "PROG"
           end
         end
 
@@ -1227,7 +1589,7 @@ function pfDatabase:SearchQuestID(id, meta, maps)
         if type == "item" then
           local i, j, itemName, objNum, objNeeded = strfind(text, pfUI.api.SanitizePattern(QUEST_OBJECTS_FOUND))
           for id in pairs(pfDatabase:GetIDByName(itemName, "items")) do
-            parse_obj["I"][id] = ( objNum + 0 >= objNeeded + 0 or done ) and "DONE" or "PROG"
+            parse_obj["I"][id] = (objNum + 0 >= objNeeded + 0 or done) and "DONE" or "PROG"
           end
         end
       end
@@ -1360,21 +1722,21 @@ function pfDatabase:SearchQuestID(id, meta, maps)
           meta = data.meta
           meta["title"] = meta["quest"]
           meta["cluster"] = true
-          meta["zone"]  = map
+          meta["zone"] = map
 
           local icon = pfQuest_config["clustermono"] == "1" and "_mono" or ""
 
           if meta.item then
-            meta["x"], meta["y"], meta["priority"] = getcluster(data.coords, meta["quest"]..hash..map)
-            meta["texture"] = pfQuestConfig.path.."\\img\\cluster_item" .. icon
+            meta["x"], meta["y"], meta["priority"] = getcluster(data.coords, meta["quest"] .. hash .. map)
+            meta["texture"] = pfQuestConfig.path .. "\\img\\cluster_item" .. icon
             pfMap:AddNode(meta, true)
           elseif meta.spawntype and meta.spawntype == pfQuest_Loc["Unit"] and meta.spawn and not meta.itemreq then
-            meta["x"], meta["y"], meta["priority"] = getcluster(data.coords, meta["quest"]..hash..map)
-            meta["texture"] = pfQuestConfig.path.."\\img\\cluster_mob" .. icon
+            meta["x"], meta["y"], meta["priority"] = getcluster(data.coords, meta["quest"] .. hash .. map)
+            meta["texture"] = pfQuestConfig.path .. "\\img\\cluster_mob" .. icon
             pfMap:AddNode(meta, true)
           else
-            meta["x"], meta["y"], meta["priority"] = getcluster(data.coords, meta["quest"]..hash..map)
-            meta["texture"] = pfQuestConfig.path.."\\img\\cluster_misc" .. icon
+            meta["x"], meta["y"], meta["priority"] = getcluster(data.coords, meta["quest"] .. hash .. map)
+            meta["texture"] = pfQuestConfig.path .. "\\img\\cluster_misc" .. icon
             pfMap:AddNode(meta, true)
           end
         end
@@ -1400,14 +1762,21 @@ function pfDatabase:SearchQuest(quest, meta, partial)
 end
 
 function pfDatabase:QuestFilter(id, plevel, pclass, prace)
+  -- fast reject: race, class, and missing loc name are session-constants,
+  -- pre-computed in BuildStaticRejectSet to avoid repeating bit ops per call
+  if pfDatabase.staticRejectSet[id] then
+    return
+  end
+
   -- hide active quest
-  if pfQuest.questlog[id] then return end
+  if pfQuest.questlog[id] then
+    return
+  end
 
   -- hide completed quests
-  if pfQuest_history[id] then return end
-
-  -- hide broken quests without names
-  if not pfDB.quests.loc[id] or not pfDB.quests.loc[id].T then return end
+  if pfQuest_history[id] then
+    return
+  end
 
   -- hide missing pre-quests
   if quests[id]["pre"] then
@@ -1420,40 +1789,91 @@ function pfDatabase:QuestFilter(id, plevel, pclass, prace)
     end
 
     -- hide if none of the pre-quests has been completed
-    if not one_complete then return end
+    if not one_complete then
+      return
+    end
   end
 
-  -- hide non-available quests for your race
-  if quests[id]["race"] and not ( bit.band(quests[id]["race"], prace) == prace ) then return end
+  -- hide non-available quests for your race (redundant when staticRejectSet is warm,
+  -- retained as fallback for the brief window before locale detection completes)
+  if quests[id]["race"] and not (bit.band(quests[id]["race"], prace) == prace) then
+    return
+  end
 
   -- hide non-available quests for your class
-  if quests[id]["class"] and not ( bit.band(quests[id]["class"], pclass) == pclass ) then return end
+  if quests[id]["class"] and not (bit.band(quests[id]["class"], pclass) == pclass) then
+    return
+  end
 
-  -- hide non-available quests for your profession
-  if quests[id]["skill"] and not pfDatabase:GetPlayerSkill(quests[id]["skill"]) then return end
+  -- hide non-available quests for your profession (uses cache when inside SearchQuests)
+  if quests[id]["skill"] and not pfDatabase:GetPlayerSkillCached(quests[id]["skill"]) then
+    return
+  end
 
   -- hide lowlevel quests
-  if quests[id]["lvl"] and quests[id]["lvl"] < plevel - 4 and pfQuest_config["showlowlevel"] == "0" then return end
+  if quests[id]["lvl"] and quests[id]["lvl"] < plevel - 4 and pfQuest_config["showlowlevel"] == "0" then
+    return
+  end
 
   -- hide highlevel quests (or show those that are 3 levels above)
-  if quests[id]["min"] and quests[id]["min"] > plevel + ( pfQuest_config["showhighlevel"] == "1" and 3 or 0 ) then return end
+  if quests[id]["min"] and quests[id]["min"] > plevel + (pfQuest_config["showhighlevel"] == "1" and 3 or 0) then
+    return
+  end
 
   -- hide event quests
-  if quests[id]["event"] and pfQuest_config["showfestival"] == "0" then return end
+  if quests[id]["event"] and pfQuest_config["showfestival"] == "0" then
+    return
+  end
 
   return true
 end
 
--- SearchQuests
--- Scans for all available quests
--- Adds map nodes for each quest starter and ender
--- Returns its map table
-function pfDatabase:SearchQuests(meta, maps)
-  local level, minlvl, maxlvl, race, class, prof, festival
-  local maps = maps or {}
-  local meta = meta or {}
+-- SearchQuests skill cache: built once per SearchQuests call, used by QuestFilter
+-- via pfDatabase:GetPlayerSkillCached(). Avoids scanning all skill lines per quest.
+pfDatabase.skillcache = {}
+function pfDatabase:BuildSkillCache()
+  for k in pairs(self.skillcache) do
+    self.skillcache[k] = nil
+  end
+  for i = 0, GetNumSkillLines() do
+    local skillName, _, _, skillRank = GetSkillLineInfo(i)
+    if skillName then
+      self.skillcache[skillName] = skillRank
+    end
+  end
+end
 
-  local plevel = UnitLevel("player")
+function pfDatabase:GetPlayerSkillCached(skill)
+  if not professions[skill] then
+    return false
+  end
+  local rank = self.skillcache[professions[skill]]
+  return rank or false
+end
+
+-- SearchQuests incremental node cache.
+-- Tracks which quest IDs passed QuestFilter on the last run. On subsequent
+-- calls only the delta (quests entering or leaving the passing set) is
+-- processed, so SearchMobID/SearchObjectID are skipped for quests whose
+-- questgiver nodes already exist. Must be cleared whenever pfMap.nodes
+-- ["PFQUEST"] is wiped (e.g. ResetAll).
+-- (Initialised at line ~435 alongside nameIndex so BuildNameIndex can clear it.)
+
+-- [patch] Inkrementeller Questgeber-Scan.
+--
+-- Jeder Quest-Abschluss loest hier einen Durchlauf ueber die komplette
+-- Questdatenbank aus (Phase 1). Auf der grossen Octo-Datenbank war das ein
+-- sichtbarer Hänger von einem Frame. BeginQuestGiverScan legt jetzt nur den
+-- Zustand an, StepQuestGiverScan arbeitet ihn Frame fuer Frame ab.
+-- SearchQuests selbst bleibt synchron, damit /db quests unveraendert laeuft.
+--
+-- GetTime() steht innerhalb eines Frames still, ein Zeitbudget ist deshalb
+-- nicht messbar. Die Portionen werden in Stueck gezaehlt.
+pfDatabase.QGSCAN_FILTER = 300 -- QuestFilter-Pruefungen pro Frame
+pfDatabase.QGSCAN_REMOVE = 800 -- Node-Loeschungen pro Frame
+pfDatabase.QGSCAN_ADD = 15 -- Questgeber-Platzierungen pro Frame
+
+function pfDatabase:BeginQuestGiverScan(meta, maps)
   local pfaction = UnitFactionGroup("player")
   if pfaction == "Horde" then
     pfaction = "H"
@@ -1464,68 +1884,200 @@ function pfDatabase:SearchQuests(meta, maps)
   end
 
   local _, race = UnitRace("player")
-  local prace = pfDatabase:GetBitByRace(race)
   local _, class = UnitClass("player")
-  local pclass = pfDatabase:GetBitByClass(class)
 
-  for id in pairs(quests) do
-    if pfDatabase:QuestFilter(id, plevel, pclass, prace) then
-      -- set metadata
-      meta["quest"] = ( pfDB.quests.loc[id] and pfDB.quests.loc[id].T ) or UNKNOWN
-      meta["questid"] = id
-      meta["texture"] = pfQuestConfig.path.."\\img\\available_c"
+  -- Skill-Cache einmal pro Scan, wird von QuestFilter benutzt
+  pfDatabase:BuildSkillCache()
 
-      meta["qlvl"] = quests[id]["lvl"]
-      meta["qmin"] = quests[id]["min"]
+  self.qgScan = {
+    phase = 1,
+    key = nil,
+    meta = meta or {},
+    maps = maps or {},
+    plevel = UnitLevel("player"),
+    pfaction = pfaction,
+    prace = pfDatabase:GetBitByRace(race),
+    pclass = pfDatabase:GetBitByClass(class),
+    currentSet = {},
+    removed = 0,
+    added = 0,
+    frames = 0,
+    t_start = GetTime(),
+  }
+end
 
-      meta["vertex"] = { 0, 0, 0 }
-      meta["layer"] = 3
+-- Arbeitet ein Stueck des laufenden Scans ab.
+-- unlimited = true laeuft in einem Rutsch durch (synchroner Pfad).
+-- Rueckgabe: true wenn der Scan fertig ist.
+function pfDatabase:StepQuestGiverScan(unlimited)
+  local s = self.qgScan
+  if not s then
+    return true
+  end
+  s.frames = s.frames + 1
 
-      -- tint high level quests red
-      if quests[id]["min"] and quests[id]["min"] > plevel then
-        meta["texture"] = pfQuestConfig.path.."\\img\\available"
-        meta["vertex"] = { 1, .6, .6 }
-        meta["layer"] = 2
+  -- Phase 1: Menge der Quests bilden, die den Filter aktuell passieren.
+  -- Der einzige O(alle Quests)-Teil. Statische Ablehnungen (falsche Rasse,
+  -- falsche Klasse, fehlender Name) sind vorberechnet.
+  if s.phase == 1 then
+    local reject = self.staticRejectSet
+    local n = 0
+    local limit = unlimited and -1 or self.QGSCAN_FILTER
+    while limit < 0 or n < limit do
+      local id = next(quests, s.key)
+      if not id then
+        s.phase, s.key = 2, nil
+        break
       end
-
-      -- tint low level quests grey
-      if quests[id]["lvl"] and quests[id]["lvl"] + 10 < plevel then
-        meta["texture"] = pfQuestConfig.path.."\\img\\available"
-        meta["vertex"] = { 1, 1, 1 }
-        meta["layer"] = 2
+      s.key = id
+      if not reject[id] and pfDatabase:QuestFilter(id, s.plevel, s.pclass, s.prace) then
+        s.currentSet[id] = true
       end
+      n = n + 1
+    end
+    if s.phase == 1 then
+      return false
+    end
+  end
 
-      -- tint event quests as blue
-      if quests[id]["event"] then
-        meta["texture"] = pfQuestConfig.path.."\\img\\available"
-        meta["vertex"] = { .2, .8, 1 }
-        meta["layer"] = 2
+  -- Phase 2: Nodes der Quests entfernen, die aus der Menge gefallen sind.
+  -- Aktive Quests auslassen: deren Nodes hat SearchQuestID gerade erst
+  -- gesetzt und duerfen hier nicht weggeraeumt werden.
+  if s.phase == 2 then
+    local n = 0
+    local limit = unlimited and -1 or self.QGSCAN_REMOVE
+    while limit < 0 or n < limit do
+      local id = next(self.lastQuestGiversSet, s.key)
+      if not id then
+        s.phase, s.key = 3, nil
+        break
       end
+      s.key = id
+      if not s.currentSet[id] and not (pfQuest and pfQuest.questlog and pfQuest.questlog[id]) then
+        local title = (pfDB.quests.loc[id] and pfDB.quests.loc[id].T) or UNKNOWN
+        pfMap:DeleteNode("PFQUEST", title)
+        s.removed = s.removed + 1
+      end
+      n = n + 1
+    end
+    if s.phase == 2 then
+      return false
+    end
+  end
 
-      -- iterate over all questgivers
-      if quests[id]["start"] then
-        -- units
-        if quests[id]["start"]["U"] then
-          meta["QTYPE"] = "NPC_START"
-          for _, unit in pairs(quests[id]["start"]["U"]) do
-            if units[unit] and strfind(units[unit]["fac"] or pfaction, pfaction) then
-              maps = pfDatabase:SearchMobID(unit, meta, maps)
-            end
-          end
+  -- Phase 3: Nodes nur fuer neu dazugekommene Quests setzen.
+  -- Bereits bekannte IDs kosten nur einen Tabellenzugriff und zaehlen nicht
+  -- gegen das Kontingent, sonst wuerde der Scan bei grosser Menge ewig laufen.
+  if s.phase == 3 then
+    local meta = s.meta
+    local plevel = s.plevel
+    local pfaction = s.pfaction
+    local n = 0
+    local limit = unlimited and -1 or self.QGSCAN_ADD
+    while limit < 0 or n < limit do
+      local id = next(s.currentSet, s.key)
+      if not id then
+        s.phase, s.key = 4, nil
+        break
+      end
+      s.key = id
+      if not self.lastQuestGiversSet[id] then
+        n = n + 1
+        s.added = s.added + 1
+
+        -- set metadata
+        meta["quest"] = (pfDB.quests.loc[id] and pfDB.quests.loc[id].T) or UNKNOWN
+        meta["questid"] = id
+        meta["texture"] = pfQuestConfig.path .. "\\img\\available_c"
+
+        meta["qlvl"] = quests[id]["lvl"]
+        meta["qmin"] = quests[id]["min"]
+
+        meta["vertex"] = VERTEX_BLACK
+        meta["layer"] = 3
+
+        -- tint high level quests red
+        if quests[id]["min"] and quests[id]["min"] > plevel then
+          meta["texture"] = pfQuestConfig.path .. "\\img\\available"
+          meta["vertex"] = VERTEX_RED
+          meta["layer"] = 2
         end
 
-        -- objects
-        if quests[id]["start"]["O"] then
-          meta["QTYPE"] = "OBJECT_START"
-          for _, object in pairs(quests[id]["start"]["O"]) do
-            if objects[object] and strfind(objects[object]["fac"] or pfaction, pfaction) then
-              maps = pfDatabase:SearchObjectID(object, meta, maps)
+        -- tint low level quests grey
+        if quests[id]["lvl"] and quests[id]["lvl"] + 10 < plevel then
+          meta["texture"] = pfQuestConfig.path .. "\\img\\available"
+          meta["vertex"] = VERTEX_WHITE
+          meta["layer"] = 2
+        end
+
+        -- tint event quests as blue
+        if quests[id]["event"] then
+          meta["texture"] = pfQuestConfig.path .. "\\img\\available"
+          meta["vertex"] = VERTEX_BLUE
+          meta["layer"] = 2
+        end
+
+        -- add questgiver nodes
+        if quests[id]["start"] then
+          -- units
+          if quests[id]["start"]["U"] then
+            meta["QTYPE"] = "NPC_START"
+            for _, unit in pairs(quests[id]["start"]["U"]) do
+              if units[unit] and strfind(units[unit]["fac"] or pfaction, pfaction) then
+                s.maps = pfDatabase:SearchMobID(unit, meta, s.maps)
+              end
+            end
+          end
+
+          -- objects
+          if quests[id]["start"]["O"] then
+            meta["QTYPE"] = "OBJECT_START"
+            for _, object in pairs(quests[id]["start"]["O"]) do
+              if objects[object] and strfind(objects[object]["fac"] or pfaction, pfaction) then
+                s.maps = pfDatabase:SearchObjectID(object, meta, s.maps)
+              end
             end
           end
         end
       end
     end
+    if s.phase == 3 then
+      return false
+    end
   end
+
+  -- Phase 4: Merkmenge auf den neuen Stand bringen.
+  -- Tabellen werden in-place geleert, um keine neue anzulegen.
+  for id in pairs(self.lastQuestGiversSet) do
+    self.lastQuestGiversSet[id] = nil
+  end
+  for id in pairs(s.currentSet) do
+    self.lastQuestGiversSet[id] = true
+  end
+
+  pfQuest:Debug(
+    format(
+      "|cffff3333TIMER SearchQuests total=%.4fs  frames=%d  remove=%d  add=%d",
+      GetTime() - s.t_start,
+      s.frames,
+      s.removed,
+      s.added
+    )
+  )
+
+  self.qgScanMaps = s.maps
+  self.qgScan = nil
+  pfMap.queue_update = GetTime()
+  return true
+end
+
+-- SearchQuests
+-- Scans for available quests and adds/removes questgiver map nodes.
+-- Synchron: legt den Scan an und arbeitet ihn in einem Rutsch ab.
+function pfDatabase:SearchQuests(meta, maps)
+  pfDatabase:BeginQuestGiverScan(meta, maps)
+  pfDatabase:StepQuestGiverScan(true)
+  return self.qgScanMaps
 end
 
 -- AddCustomIcon
@@ -1534,7 +2086,9 @@ end
 --   img: path to the image that is appended to root
 --   root: optional, default: "Interface\\AddOns\\pfQuest"
 function pfDatabase:AddCustomIcon(id, img, root)
-  if not id or not img then return end
+  if not id or not img then
+    return
+  end
 
   root = root and root .. "\\" or pfQuestConfig.path .. "\\"
 
@@ -1549,13 +2103,24 @@ function pfDatabase:AddCustomIcon(id, img, root)
 end
 
 function pfDatabase:FormatQuestText(questText)
+  -- A quest whose locale entry has no "O" or "D" field arrives here as nil and
+  -- gsub throws. Most callers test the field first; the ones feeding the
+  -- [Translate] button index the locale table directly.
+  --
+  -- An entry loses a field when a database pack carries a quest the base
+  -- database has never heard of: a per-field merge has no base entry to merge
+  -- into, so it assigns the pack's record whole, absent fields included.
+  -- (An earlier version of this comment blamed whole-entry patchtable
+  -- assignment -- corrected 2026-08-10, the pack merges per-field now.)
+  if not questText then return "" end
+
   questText = string.gsub(questText, "$[Nn]", UnitName("player"))
   questText = string.gsub(questText, "$[Cc]", strlower(UnitClass("player")))
   questText = string.gsub(questText, "$[Rr]", strlower(UnitRace("player")))
   questText = string.gsub(questText, "$[Bb]", "\n")
   -- UnitSex("player") returns 2 for male and 3 for female
   -- that's why there is an unused capture group around the $[Gg]
-  return string.gsub(questText, "($[Gg])([^:]+):([^;]+);", "%"..UnitSex("player"))
+  return string.gsub(questText, "($[Gg])([^:]+):([^;]+);", "%" .. UnitSex("player"))
 end
 
 -- GetQuestIDs
@@ -1564,9 +2129,11 @@ end
 function pfDatabase:GetQuestIDs(qid)
   if GetQuestLink then
     local questLink = GetQuestLink(qid)
-      if questLink then
+    if questLink then
       local _, _, id = strfind(questLink, "|c.*|Hquest:([%d]+):([-]?[%d]+)|h%[(.*)%]|h|r")
-      if id then return { [1] = tonumber(id) } end
+      if id then
+        return { [1] = tonumber(id) }
+      end
     end
   end
 
@@ -1576,8 +2143,10 @@ function pfDatabase:GetQuestIDs(qid)
   local title, level, _, header = compat.GetQuestLogTitle(qid)
   SelectQuestLogEntry(oldID)
 
-  if header or not title then return end
-  local identifier = title .. ":" .. ( level or "") .. ":" .. ( objective or "") .. ":" .. ( text or "")
+  if header or not title then
+    return
+  end
+  local identifier = title .. ":" .. (level or "") .. ":" .. (objective or "") .. ":" .. (text or "")
 
   -- always make sure the quest-cache exists
   pfQuest_questcache = pfQuest_questcache or {}
@@ -1597,13 +2166,15 @@ function pfDatabase:GetQuestIDs(qid)
   local tcount = 0
   -- check if multiple quests share the same name
   for id, data in pairs(pfDB["quests"]["loc"]) do
-    if quests[id] and data.T == title then tcount = tcount + 1 end
+    if quests[id] and data.T == title then
+      tcount = tcount + 1
+    end
   end
 
   -- no title was found, run levenshtein on titles
   if tcount == 0 and title then
     local tlen = string.len(title)
-    local tscore, tbest, ttitle = nil, math.min(tlen/2, 5), nil
+    local tscore, tbest, ttitle = nil, math.min(tlen / 2, 5), nil
     for id, data in pairs(pfDB["quests"]["loc"]) do
       if quests[id] and data.T then
         tscore = lev(data.T, title, tbest)
@@ -1643,12 +2214,12 @@ function pfDatabase:GetQuestIDs(qid)
       end
 
       -- check race and set score
-      if quests[id]["race"] and ( bit.band(quests[id]["race"], prace) == prace ) then
+      if quests[id]["race"] and (bit.band(quests[id]["race"], prace) == prace) then
         score = score + 8
       end
 
       -- check class and set score
-      if quests[id]["class"] and ( bit.band(quests[id]["class"], pclass) == pclass ) then
+      if quests[id]["class"] and (bit.band(quests[id]["class"], pclass) == pclass) then
         score = score + 8
       end
 
@@ -1656,15 +2227,19 @@ function pfDatabase:GetQuestIDs(qid)
       -- to compare quest text distances in order to estimate the best quest id
       if tcount > 1 then
         -- check objective and calculate score
-        score = score + max(24 - lev(pfDatabase:FormatQuestText(pfDB.quests.loc[id]["O"]), objective, 24),0)
+        score = score + max(24 - lev(pfDatabase:FormatQuestText(pfDB.quests.loc[id]["O"]), objective, 24), 0)
 
         -- check description and calculate score
-        score = score + max(24 - lev(pfDatabase:FormatQuestText(pfDB.quests.loc[id]["D"]), text, 24),0)
+        score = score + max(24 - lev(pfDatabase:FormatQuestText(pfDB.quests.loc[id]["D"]), text, 24), 0)
       end
 
-      if score > best then best = score end
+      if score > best then
+        best = score
+      end
       results[score] = results[score] or {}
-      if score > 0 then table.insert(results[score], id) end
+      if score > 0 then
+        table.insert(results[score], id)
+      end
     end
   end
 
@@ -1675,7 +2250,7 @@ end
 
 -- browser search related defaults and values
 pfDatabase.lastSearchQuery = ""
-pfDatabase.lastSearchResults = {["items"] = {}, ["quests"] = {}, ["objects"] = {}, ["units"] = {}}
+pfDatabase.lastSearchResults = { ["items"] = {}, ["quests"] = {}, ["objects"] = {}, ["units"] = {} }
 
 -- BrowserSearch
 -- Search for a list of IDs of the specified `searchType` based on if `query` is
@@ -1696,37 +2271,38 @@ function pfDatabase:BrowserSearch(query, searchType)
   local queryLength = strlen(query) -- needed for some checks
   local queryNumber = tonumber(query) -- if nil, the query is NOT a number
   local results = {} -- save results
-  local resultCount = 0; -- count results
+  local resultCount = 0 -- count results
 
   -- Set the DB to be searched
   local minChars = 3
   local minInts = 1
   if (queryLength >= minChars) or (queryNumber and (queryLength >= minInts)) then -- make sure this is no fav display
-    if ((queryLength > minChars) or (queryNumber and (queryLength > minInts)))
-       and (pfDatabase.lastSearchQuery ~= "" and queryLength > strlen(pfDatabase.lastSearchQuery))
+    if
+      ((queryLength > minChars) or (queryNumber and (queryLength > minInts)))
+      and (pfDatabase.lastSearchQuery ~= "" and queryLength > strlen(pfDatabase.lastSearchQuery))
     then
       -- there are previous search results to use
       local searchDatabase = pfDatabase.lastSearchResults[searchType]
       -- iterate the last search
       for id, _ in pairs(searchDatabase) do
         local dbLocale = pfDB[searchType]["loc"][id]
-        if (dbLocale) then
+        if dbLocale then
           local compare
           local search = query
-          if (queryNumber) then
+          if queryNumber then
             -- do number search
             compare = tostring(id)
           else
             -- do name search
             search = strlower(query)
-            if (searchType == "quests") then
+            if searchType == "quests" then
               compare = strlower(dbLocale["T"])
             else
               compare = strlower(dbLocale)
             end
           end
           -- search and save on match
-          if (strfind(compare, search)) then
+          if strfind(compare, search) then
             results[id] = dbLocale
             resultCount = resultCount + 1
           end
@@ -1735,13 +2311,13 @@ function pfDatabase:BrowserSearch(query, searchType)
       return results, resultCount
     else
       -- no previous results, search whole DB
-      if (queryNumber) then
+      if queryNumber then
         results = pfDatabase:GetIDByIDPart(query, searchType)
       else
         results = pfDatabase:GetIDByName(query, searchType, true)
       end
       local resultCount = 0
-      for _,_ in pairs(results) do
+      for _, _ in pairs(results) do
         resultCount = resultCount + 1
       end
       return results, resultCount
@@ -1755,7 +2331,7 @@ end
 local function LoadCustomData(always)
   -- table.getn doesn't work here :/
   local icount = 0
-  for _,_ in pairs(pfQuest_server["items"]) do
+  for _, _ in pairs(pfQuest_server["items"]) do
     icount = icount + 1
   end
 
@@ -1763,7 +2339,9 @@ local function LoadCustomData(always)
     for id, name in pairs(pfQuest_server["items"]) do
       pfDB["items"]["loc"][id] = name
     end
-    DEFAULT_CHAT_FRAME:AddMessage("|cff33ffccpf|cffffffffQuest: |cff33ffcc" .. icount .. "|cffffffff " .. pfQuest_Loc["custom items loaded."])
+    DEFAULT_CHAT_FRAME:AddMessage(
+      "|cff33ffccpf|cffffffffQuest: |cff33ffcc" .. icount .. "|cffffffff " .. pfQuest_Loc["custom items loaded."]
+    )
   end
 end
 
@@ -1784,7 +2362,7 @@ pfServerScan.header:SetPoint("CENTER", 0, 0)
 
 pfServerScan:RegisterEvent("VARIABLES_LOADED")
 pfServerScan:SetScript("OnEvent", function()
-  pfQuest_server = pfQuest_server or { }
+  pfQuest_server = pfQuest_server or {}
   pfQuest_server["items"] = pfQuest_server["items"] or {}
   LoadCustomData()
 end)
@@ -1808,8 +2386,10 @@ pfServerScan:SetScript("OnUpdate", function()
   end
 
   -- scan X items per update
-  for i=this.scanID,this.scanID+this.perloop do
-    pfServerScan.header:SetText(pfQuest_Loc["Scanning server for items..."] .. " " .. string.format("%.1f",100*i/this.max) .. "%")
+  for i = this.scanID, this.scanID + this.perloop do
+    pfServerScan.header:SetText(
+      pfQuest_Loc["Scanning server for items..."] .. " " .. string.format("%.1f", 100 * i / this.max) .. "%"
+    )
     local link = "item:" .. i .. ":0:0:0"
 
     ItemRefTooltip:SetOwner(UIParent, "ANCHOR_PRESERVE")
@@ -1821,7 +2401,6 @@ pfServerScan:SetScript("OnUpdate", function()
 
       -- skip-wait for item retrieval
       if name == (RETRIEVING_ITEM_INFO or "") then
-
         if not ignore[i] then
           if custom_id == i and custom_skip >= 3 then
             -- ignore item and proceed
@@ -1846,11 +2425,33 @@ pfServerScan:SetScript("OnUpdate", function()
     end
   end
 
-  this.scanID = this.scanID+this.perloop
+  this.scanID = this.scanID + this.perloop
 end)
 
 function pfDatabase:ScanServer()
   pfServerScan:Show()
+end
+
+-- Pre-create frame and handler for QueryServer (avoid creating per call)
+local queryFrame
+local function OnQuestQueryComplete(self)
+  self:UnregisterEvent("QUEST_QUERY_COMPLETE")
+
+  -- Retrieve completed quests after the QUEST_QUERY_COMPLETE event
+  local completedQuests = GetQuestsCompleted()
+
+  if type(completedQuests) == "table" then
+    for questID, _ in pairs(completedQuests) do
+      pfQuest_history[questID] = { time(), UnitLevel("player") }
+    end
+
+    -- Reset all quest markers after processing completed quests
+    pfQuest:ResetAll()
+  elseif completedQuests == nil then
+    print("Error: GetQuestsCompleted() returned nil.")
+  else
+    print("Error: GetQuestsCompleted() did not return a valid table. Value: ", completedQuests)
+  end
 end
 
 function pfDatabase:QueryServer()
@@ -1860,32 +2461,12 @@ function pfDatabase:QueryServer()
     return
   end
 
-  QueryQuestsCompleted()  -- Send the request to the server
-
-  local frame = CreateFrame("Frame")  -- Create a new frame
-  frame:RegisterEvent("QUEST_QUERY_COMPLETE")  -- Register the event on the frame
-
-  local function OnQuestQueryComplete()
-    frame:UnregisterEvent("QUEST_QUERY_COMPLETE")  -- Unregister the event once it's triggered
-
-    -- Retrieve completed quests after the QUEST_QUERY_COMPLETE event
-    local completedQuests = GetQuestsCompleted()
-
-    if type(completedQuests) == "table" then
-      for questID, _ in pairs(completedQuests) do
-        pfQuest_history[questID] = { time(), UnitLevel("player") }
-      end
-
-      -- Reset all quest markers after processing completed quests
-      pfQuest:ResetAll()
-    elseif completedQuests == nil then
-      -- Handle the case where GetQuestsCompleted() returned nil
-      print("Error: GetQuestsCompleted() returned nil.")
-    else
-      -- Handle the case where GetQuestsCompleted() did not return a valid table
-      print("Error: GetQuestsCompleted() did not return a valid table. Value: ", completedQuests)
-    end
+  -- Reuse frame instead of creating new one each call
+  if not queryFrame then
+    queryFrame = CreateFrame("Frame")
+    queryFrame:SetScript("OnEvent", OnQuestQueryComplete)
   end
 
-  frame:SetScript("OnEvent", OnQuestQueryComplete)  -- Set the event handler
+  queryFrame:RegisterEvent("QUEST_QUERY_COMPLETE")
+  QueryQuestsCompleted()
 end
