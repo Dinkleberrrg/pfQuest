@@ -1,6 +1,6 @@
 # Changelog (OctoWoW fork) – pfQuest
 
-> Branch `octowow` = the state from Henry's "OctoWoW – HD Upgrade" install (WoW 1.12). Own changes are marked with `-- [patch]` in the code.
+> Branch `octowow` = the state from Dinkleberrrg's "OctoWoW – HD Upgrade" install (WoW 1.12). Own changes are marked with `-- [patch]` in the code.
 
 ## Where the installed version comes from
 
@@ -11,7 +11,7 @@ The installed pfQuest is not a direct copy of shagu/pfQuest but a chain of forks
 3. **roby-brok/pfQuest** (version 8.0.1, "fork by Roby_Brok") for OctoWoW. That repository is no longer reachable on GitHub; its changes are described in the bundled README.md.
 4. **Own changes** (see below).
 
-That is why `git diff main octowow` shows a lot of changes (about 70 files). Most of them come from steps 2 and 3, not from Henry.
+That is why `git diff main octowow` shows a lot of changes (about 70 files). Most of them come from steps 2 and 3, not from Dinkleberrrg.
 
 ## Changes by Roby_Brok (according to the fork's README)
 
