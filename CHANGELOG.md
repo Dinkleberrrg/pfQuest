@@ -2,6 +2,14 @@
 
 > Branch `octowow` = the state from Dinkleberrrg's "OctoWoW – HD Upgrade" install (WoW 1.12). Own changes are marked with `-- [patch]` in the code.
 
+
+## Releases
+
+Version scheme: `<upstream version>-octo.<n>`. Each release is a git tag `v<version>`; older versions can be downloaded from the tag page on GitHub.
+
+### 8.0.1-octo.1 – 2026-10-03
+- First tagged release with the changes listed below.
+
 ## Where the installed version comes from
 
 The installed pfQuest is not a direct copy of shagu/pfQuest but a chain of forks:
