@@ -1,3 +1,14 @@
+## OctoWoW changes compared to the original
+
+Original: **shagu/pfQuest (via The-Kludge-Bureau and Roby_Brok's OctoWoW build)**. This fork (by Dinkleberrrg) changes:
+
+- Quest giver scan after turning in a quest now runs in small steps per frame instead of freezing the game.
+- Everything else differing from shagu comes from The-Kludge-Bureau and Roby_Brok, see CHANGELOG.md.
+
+Details: [CHANGELOG.md](CHANGELOG.md)
+
+---
+
 > ## This is a fork
 >
 > [pfQuest](https://github.com/The-Kludge-Bureau/pfQuest) maintained for the
